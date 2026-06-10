@@ -1,0 +1,805 @@
+import pandas as pd
+import matplotlib
+matplotlib.rcParams['font.sans-serif'] = ['Microsoft YaHei']  # 或 'SimHei'
+matplotlib.rcParams['axes.unicode_minus'] = False
+import numpy as np
+import os
+
+# ====== 1 读取数据 ====== 注意以 8:00:00为例 o为当前价格 c为12:00的价格 hl为8-12点的最高最低价
+# ---- 宏观经济类 ----
+macro_paths = {
+    "VIX": "VIX_4h.csv",              # 芝加哥波动率指数（市场恐慌指标）
+    "SPX": "SPX_4h.csv",              # 标普500指数（美股市场走势）
+    "NASX": "NASX_4h.csv",            # 纳斯达克综合指数
+    "GBTC": "GBTC_4h.csv",            # 灰度比特币信托基金（比特币溢价指标）
+    "DXY": "DXY_4h.csv",              # 美元指数（宏观流动性指标）
+    "OVX": "OVX_4h.csv",              # 原油波动率指数（能源市场风险指标）
+    "XAUUSD": "XAUUSD_4h.csv",        # 现货黄金价格（避险资产代表）
+    "TLT": "TLT_4h.csv",
+    "SHY": "SHY_4h.csv"
+}
+
+# ---- ETH 市场类（共 11 个） ----
+eth_paths = {
+    "eth_hist":              "eth_1h_hist_4h.csv",           # ETH 历史K线（开高低收成交量）
+    "eth_vol_weight":        "eth_1h_volweightohlc_4h.csv",         # 按成交量加权的资金费率
+    "eth_oi_weight":         "eth_1h_oiweightohlc_4h.csv",          # 按持仓量加权的资金费率
+
+    "eth_dvol":              "eth_1h_Dvol_4h.csv",           # Deribit 隐含波动率（聚合为4h）
+    "eth_liq":               "eth_1h_liq_4h.csv",            # （可选）多空爆仓金额（4h）
+    "eth_oi":                "eth_1h_marketoi_4h.csv",       # 市场持仓量（Open Interest）
+    "eth_buy_sell":          "eth_1h_buy_sell_4h.csv",       # 主动买入/卖出成交量
+    "eth_coinmarketcap":     "eth_1h_coinmarketcap_4h.csv",  # 市值与流通量等指标
+    "eth_trans_btc":         "eth_1h_eth_trans_btc_4h.csv",  # ETH/BTC 链上转账比率
+    "eth_stable_margin":     "eth_1h_stablecoin-margin_4h.csv", # 稳定币保证金占比
+    "eth_timeseries":        "eth_1h_timeseries_4h.csv",     # ETH 价格及波动时间序列（辅助特征）
+    # "eth_4h_VWAP":           "eth_4h_vwap.csv",              # 4小时加权平均成交价（VWAP 目标）
+}
+
+def read_full_csv(path):
+    """读取单个CSV：
+    - 自动识别时间列（包含 'time' 或 'date'）
+    - 去掉时区，统一为 tz-naive
+    - 仅保留数值列 + datetime
+    - 不做任何聚合/平均，保留原始字段（如 c/h/l/o/vol/buy/sell/...）
+    """
+    if not os.path.exists(path):
+        print(f"⚠️ 文件不存在：{path}")
+        return None
+
+    df = pd.read_csv(path)
+    df.columns = [c.strip().lower() for c in df.columns]
+
+    # 时间列
+    time_col = next((c for c in df.columns if ('time' in c) or ('date' in c)), None)
+    if time_col is None:
+        raise ValueError(f"{path} 缺少时间列")
+    df[time_col] = pd.to_datetime(df[time_col], errors="coerce")
+    df[time_col] = df[time_col].dt.tz_localize(None)  # 统一去时区
+    df = df.dropna(subset=[time_col]).sort_values(time_col).reset_index(drop=True)
+    df = df.rename(columns={time_col: "datetime"})
+
+    # 只保留数值列
+    numeric_cols = [c for c in df.columns if c != "datetime" and np.issubdtype(df[c].dtype, np.number)]
+    if not numeric_cols:
+        raise ValueError(f"{path} 无数值列可用")
+    df = df[["datetime"] + numeric_cols]
+    return df
+
+
+def load_all_data(macro_paths, eth_paths):
+    """批量读取，给每个数值列加上文件名前缀，避免重名冲突"""
+    all_data: dict[str, pd.DataFrame] = {}
+    for name, path in {**macro_paths, **eth_paths}.items():
+        try:
+            df = read_full_csv(path)
+            if df is None:
+                continue
+            # 为防止列名冲突，加前缀（datetime 不加）
+            rename_map = {c: f"{name}_{c}" for c in df.columns if c != "datetime"}
+            df = df.rename(columns=rename_map)
+            all_data[name] = df
+        except Exception as e:
+            print(f"❌ 读取失败 {name}: {e}")
+    return all_data
+
+# ==== 执行读取 ====
+all_data = load_all_data(macro_paths, eth_paths)
+
+# ====== 2️⃣ 精确时间对齐合并 并划分训练集测试集 ======
+# 确认所有表都有相同的 datetime 频率
+for name, df in all_data.items():
+    print(f"{name:20s} -> {df['datetime'].min()} ~ {df['datetime'].max()}, {len(df)} rows")
+
+# 以基准表（ETH 1h）为主，做“精确 inner join”
+from functools import reduce
+
+dfs = list(all_data.values())
+merged = reduce(lambda left, right: pd.merge(left, right, on="datetime", how="inner"), dfs)
+
+merged = merged.sort_values("datetime").reset_index(drop=True)
+print("✅ 合并完成：", merged.shape)
+print("时间范围：", merged['datetime'].min(), "→", merged['datetime'].max())
+
+# ====== 划分训练 / 测试集（时序切分） ======
+train_start = pd.Timestamp("2024-01-03")
+train_end   = pd.Timestamp("2025-02-01")
+test_start  = train_end
+test_start  = pd.Timestamp("2025-02-01")
+test_end    = pd.Timestamp("2025-04-01")
+
+train_df = merged[(merged["datetime"] >= train_start) & (merged["datetime"] < train_end)].copy()
+test_df  = merged[(merged["datetime"] >= test_start) & (merged["datetime"] < test_end)].copy()
+
+print("Train:", train_df["datetime"].min(), "→", train_df["datetime"].max(), train_df.shape)
+print("Test :", test_df["datetime"].min(),  "→", test_df["datetime"].max(),  test_df.shape)
+# === 输出列名 ===
+print("\n📊 表头字段（共 %d 列）：" % len(merged.columns))
+print(merged.columns.tolist())
+
+
+# 特征平滑函数
+def hp_filter_kalman(ts: pd.Series, lamb: float = 1600) -> pd.Series:
+    """
+    最稳定的单边 HP（State-space + Kalman Filter 实现）
+    - 不使用未来数据
+    - 无断崖
+    - 金融时间序列最推荐方式
+    """
+
+    y = ts.astype(float).copy().values
+    n = len(y)
+
+    # === 状态空间模型 (local linear trend model) ===
+    # x_t = [tau_t, tau'_t]
+    # tau'_t 是趋势的一阶导数（斜率）
+
+    # 状态转移矩阵
+    F = np.array([[1, 1],
+                  [0, 1]])
+
+    # 观测矩阵
+    H = np.array([[1, 0]])
+
+    # 噪声协方差
+    # HP λ 等价于 R / Q
+    R = 1.0                   # 观测噪声
+    Q = 1.0 / lamb            # 趋势噪声（越小越平滑）
+
+    # 协方差
+    Qm = np.array([[Q, 0],
+                   [0, Q]])
+
+    P = np.eye(2) * 1e6       # 初始协方差
+    x = np.array([y[0], 0.0]) # 初始趋势 + 斜率
+
+    trend = np.zeros(n)
+
+    # === 单边 Kalman Filter ===
+    for t in range(n):
+        # 预测
+        x_pred = F @ x
+        P_pred = F @ P @ F.T + Qm
+
+        # 更新
+        yt = np.array([y[t]])
+        S = H @ P_pred @ H.T + R
+        K = P_pred @ H.T @ np.linalg.inv(S)
+
+        x = x_pred + K @ (yt - H @ x_pred)
+        P = (np.eye(2) - K @ H) @ P_pred
+
+        trend[t] = x[0]
+
+    return pd.Series(trend, index=ts.index)
+
+
+# ====== 3️⃣ 共享基础特征（所有任务通用） ======
+# === 基础价格字段 ===
+# =========================================
+eps = 1e-9
+
+# === 基础价格字段 ===
+merged['open']  = merged['eth_hist_o']
+merged['high']  = merged['eth_hist_h']
+merged['low']   = merged['eth_hist_l']
+merged['close'] = merged['eth_hist_c']
+
+# === 均线与趋势相关特征 ===
+merged['ma7']   = merged['close'].rolling(7).mean()
+merged['ma30']  = merged['close'].rolling(30).mean()
+merged['ma_diff_short'] = merged['ma7'] - merged['ma30']
+
+# === MACD（趋势/动量）===
+_ema12 = merged['close'].ewm(span=12, adjust=False).mean()   # 12×4h≈48h
+_ema26 = merged['close'].ewm(span=26, adjust=False).mean()   # 26×4h≈4天半
+merged['macd_line']   = _ema12 - _ema26
+merged['macd_signal'] = merged['macd_line'].ewm(span=9, adjust=False).mean()
+merged['macd_hist']   = merged['macd_line'] - merged['macd_signal']
+merged['macd_slope']  = merged['macd_hist'].diff()
+
+# === Bollinger 布林带宽度（波动形态）===
+n_bool = 20
+merged['boll_m'] = merged['close'].rolling(window=n_bool).mean()
+std = merged['close'].rolling(window=n_bool).std()
+merged['boll_h'] = merged['boll_m'] + 2 * std
+merged['boll_l'] = merged['boll_m'] - 2 * std
+merged['boll_width'] = merged['boll_h'] - merged['boll_l']
+
+# === RSI6 + 随机RSI（震荡 / 超买超卖）===
+rsi_windows = 6
+delta = merged['close'].diff()
+gain_rsi = delta.where(delta > 0, 0)
+loss_rsi = -delta.where(delta < 0, 0)
+avg_gain = gain_rsi.ewm(alpha=1/rsi_windows, min_periods=rsi_windows).mean()
+avg_loss = loss_rsi.ewm(alpha=1/rsi_windows, min_periods=rsi_windows).mean()
+rs = avg_gain / (avg_loss + eps)
+merged['rsi6'] = 100 - (100 / (1 + rs))
+merged['stoch_rsi_raw']  = (merged['rsi6'] - merged['rsi6'].rolling(window=12).min()) \
+                       / (merged['rsi6'].rolling(window=12).max() - merged['rsi6'].rolling(window=12).min()) * 100
+merged['stoch_rsi']  = merged['stoch_rsi_raw'].rolling(window=6).mean()
+
+# 波动率代理
+merged['vol_ratio'] = merged['VIX_c'] / (merged['OVX_c'] + + 1e-8)
+
+# === VIX（恐慌指数跳变与标准化）===
+_wz = 15
+merged['vix_z'] = (merged['VIX_c'] - merged['VIX_c'].rolling(_wz).mean()) / (merged['VIX_c'].rolling(_wz).std() + eps)
+merged['vix_jump10'] = (merged['VIX_c'] / (merged['VIX_c'].ewm(span=3, adjust=False).mean() + eps)) - 1.0
+
+# === OI / Funding 拥挤度 ===
+merged['funding_rate'] = merged['eth_oi_weight_o']
+merged['oi_change'] = merged['eth_oi_c'].pct_change()
+merged['funding_z'] = (merged['funding_rate'] - merged['funding_rate'].rolling(_wz).mean()) / (merged['funding_rate'].rolling(_wz).std() + eps)
+merged['oi_z'] = (merged['eth_oi_c'] - merged['eth_oi_c'].rolling(_wz).mean()) / (merged['eth_oi_c'].rolling(_wz).std() + eps)
+merged['crowding'] = merged['funding_z'] * merged['oi_z']
+
+# === SPX 共振（跨市场相关 / beta）===
+spx_ret = np.log(merged['SPX_c']).diff()
+eth_ret = np.log(merged['close']).diff()
+_wb = 18
+merged['corr_spx_eth'] = eth_ret.rolling(_wb).corr(spx_ret)
+merged['beta_spx'] = eth_ret.rolling(_wb).cov(spx_ret) / (spx_ret.rolling(_wb).var() + eps)
+
+# === 波动率滚动特征（VIX / OVX）===
+# 平滑后
+# merged['VIX_smooth'] = hp_filter_kalman(merged['VIX_c'], lamb=10000)
+# merged['OVX_smooth'] = hp_filter_kalman(merged['VIX_c'], lamb=10000)
+# merged['VIX_c_rolling_std_3'] = merged['VIX_smooth'].rolling(3).std()
+# merged['OVX_c_rolling_std_3'] = merged['OVX_smooth'].rolling(3).std()
+# merged['VIX_c_rolling_std_5'] = merged['VIX_smooth'].rolling(5).std()
+
+
+merged['VIX_c_rolling_std_3'] = merged['VIX_c'].rolling(3).std()
+merged['OVX_c_rolling_std_3'] = merged['OVX_c'].rolling(3).std()
+merged['VIX_c_rolling_std_5'] = merged['VIX_c'].rolling(5).std()
+
+#
+N = 20  # 例如过去20小时
+merged['ex_oi'] = (merged['eth_oi_c'] - merged['eth_oi_c'].rolling(N).mean()) / \
+                  (merged['eth_oi_c'].rolling(N).mean() + 1e-9)
+
+#
+merged['VIX_c_rolling_std_10'] = merged['VIX_c'].rolling(window=10).std()
+merged['VIX_c_rolling_std_20'] = merged['VIX_c'].rolling(window=20).std()
+merged['VIX_c_rolling_mean_10'] = merged['VIX_c'].rolling(window=10).mean()
+
+merged['ret_4h']   = np.log(merged['close']).diff()
+merged['dvol_level'] = merged['eth_dvol_c']
+merged['rv_24h']  = merged['ret_4h'].rolling(6).std()        # 过去24h波动
+merged['dvol_z'] = (merged['dvol_level'] - merged['dvol_level'].rolling(15).mean()) / (merged['dvol_level'].rolling(15).std() + eps)
+_rv_z = (merged['rv_24h'] - merged['rv_24h'].rolling(15).mean()) / (merged['rv_24h'].rolling(15).std() + eps)
+merged['iv_rv_gap'] = merged['dvol_z'] - _rv_z
+
+# 搞宏观模型
+merged['NASX_smooth'] = hp_filter_kalman(merged['NASX_c'], lamb=10000)
+merged['VIX_smooth'] = hp_filter_kalman(merged['VIX_c'], lamb=10000)
+merged['DXY_smooth'] = hp_filter_kalman(merged['DXY_c'], lamb=10000)
+# merged['eth_c_smooth'] = hp_filter_kalman(merged['eth_hist_c'], lamb=10000000)
+merged['xauusd_smooth'] = hp_filter_kalman(merged['XAUUSD_c'], lamb=10000000000000000000000000)
+merged['xauusd_det'] = merged['XAUUSD_c'] - merged['xauusd_smooth']
+merged['DXY_smooth_bigbig'] = hp_filter_kalman(merged['DXY_c'], lamb=10000000000000000000000000)
+# merged['DXY_det'] = merged['DXY_smooth'] - merged['DXY_smooth_bigbig']
+merged['DXY_det'] = merged['DXY_c'] - merged['DXY_smooth_bigbig']
+
+# === 特征选择 ===
+# 手工特征
+features = [
+    # 新加
+    'TLT_c',
+    'SHY_c',
+    # 'eht_'
+    # 趋势/动量
+    'macd_hist',
+    'macd_slope',
+    'ma_diff_short',
+    # 买卖量
+    'eth_hist_vol',
+    # 波动/形态
+    'boll_width',
+    'vol_ratio',
+    'vix_jump10',
+    'vix_z',
+    # 资金位/仓位
+    'oi_change',
+    'funding_rate',
+    'crowding',
+    # 跨市场关系/宏观 beta
+    'beta_spx',
+    'corr_spx_eth',
+    # 震荡/超买超卖
+    'stoch_rsi',
+    # 特征提取特征
+    'VIX_c_rolling_std_3',
+    'OVX_c_rolling_std_3',
+    'VIX_c_rolling_std_5',
+    # 宏观
+    'NASX_smooth',
+    'DXY_smooth',
+    'DXY_det',
+    'xauusd_det',
+    # 额外
+    # 'VIX_c_rolling_std_10', 'VIX_c_rolling_std_20', 'VIX_c_rolling_mean_10', 'iv_rv_gap', 'ex_oi'
+    'ex_oi',
+    'iv_rv_gap',
+    'VIX_c_rolling_std_10',
+    'VIX_c_rolling_std_20',
+    'VIX_c_rolling_mean_10',
+    'eth_coinmarketcap_volume'
+]
+
+print(f"✅ 最终特征总数: {len(features)}")
+
+
+# ========= 预测目标 ============
+
+merged['open']  = merged['eth_hist_o']       # 开盘价（Open）
+merged['high']  = merged['eth_hist_h']       # 最高价（High）
+merged['low']   = merged['eth_hist_l']       # 最低价（Low）
+merged['close'] = merged['eth_hist_c']       # 收盘价（Close）
+eps = 1e-9
+# 目标 4
+# merged['eth_samrt'] = (merged['high'] + merged['low'] + 3 * merged['close']) / 5.0
+# merged['eth_samrt'] = (merged['high'] + merged['low'] + 2.5 * merged['close']) / 4.5
+merged['eth_samrt'] = (merged['high'] + merged['low'] + 2 * merged['close']) / 4.0
+# merged['eth_samrt'] = (merged['high'] + merged['low'] + 1.5 * merged['close']) / 3.5
+# merged['eth_samrt'] = (merged['high'] + merged['low'] + merged['close']) / 3.0
+# merged['eth_samrt'] = (merged['high'] + merged['low'] + 0.5 * merged['close']) / 2.5
+# merged['eth_samrt'] = (merged['high'] + merged['low']) / 2.0
+# merged['eth_samrt'] = merged['close']
+merged['y_ret_samrt'] = np.log(merged['eth_samrt'].shift(-1) / merged['eth_samrt'])
+merged['y_target'] = merged['y_ret_samrt']
+
+merged['y_target'].hist(bins=100)
+print(merged['y_target'].describe())
+merged = merged.dropna(subset=['y_target']).reset_index(drop=True)
+print(" Target已经生成 ")
+print(merged[['datetime', 'eth_hist_c', 'y_target']].head())
+
+
+# ====== 归一化 均值0 方差1 上下限+-4 ======
+import numpy as np
+
+CLIP = 4.0
+WINDOW = 30 * 6   # 4h 一根 → 30天 ≈ 30*6 = 180 根
+
+# 1) 取出全部特征
+X_raw = merged[features].copy()
+
+# 2) 为了只用“过去”的数据，先整体 shift(1)
+X_shifted = X_raw.shift(1)
+# X_shifted = X_raw
+
+# 3) 用前 WINDOW 根计算滚动均值 / 方差（NaN 会被忽略）
+roll_mean = X_shifted.rolling(window=WINDOW, min_periods=WINDOW).mean()
+roll_std  = X_shifted.rolling(window=WINDOW, min_periods=WINDOW).std(ddof=0)
+
+# 4) 计算滚动 z-score 并裁剪到 ±4
+X_all = (X_raw - roll_mean) / roll_std
+X_all = X_all.clip(-CLIP, CLIP)
+
+# === 构建训练 / 测试集 ===
+train_mask = (merged["datetime"] >= train_start) & (merged["datetime"] < train_end)
+test_mask  = (merged["datetime"] >= test_start) & (merged["datetime"] < test_end)
+
+X_train = X_all.loc[train_mask]
+X_test  = X_all.loc[test_mask]
+y_train = merged.loc[train_mask, "y_target"]
+y_test  = merged.loc[test_mask, "y_target"]
+time_test = merged.loc[test_mask, "datetime"]
+print(f"特征维度: {X_train.shape[1]}, 训练样本: {len(X_train)}, 测试样本: {len(X_test)}")
+
+# ==========================================
+#  🔬 用 PyGAD 做 GA 特征选择（15~25 个特征）
+# ==========================================
+import pygad
+from lightgbm import LGBMRegressor
+from sklearn.metrics import mean_squared_error
+
+# ---- 你可以在这里选择 GA 的优化目标 ----
+# 可选: "rmse"（测试集 RMSE 越小越好）
+#       "sharpe"（测试集回测年化 Sharpe 越大越好）
+#       "total_return"（测试集总收益率越高越好）
+# GA_OBJECTIVE = "total_return"
+# GA_OBJECTIVE = "max_drawdown_pct"
+# GA_OBJECTIVE = "rmse"
+# GA_OBJECTIVE = "sharpe"
+GA_OBJECTIVE = "combo"
+
+MIN_FEATURES = 10
+MAX_FEATURES = 16
+
+feature_names = X_train.columns.tolist()
+n_features = len(feature_names)
+
+# 回测时用到的价格和时间（测试集区间）
+close_test_full = merged.loc[test_mask, "eth_hist_c"].reset_index(drop=True)
+time_test_full  = merged.loc[test_mask, "datetime"].reset_index(drop=True)
+
+
+# ===== 新增：多场景列表（scenario_list） =====
+# 先用你当前这一刀 Train/Test 做成第一个场景
+# ===== 多场景 Train/Test 设计（GA 用）=====
+
+def make_mask(start, end):
+    return (merged["datetime"] >= start) & (merged["datetime"] < end)
+
+# === 场景 1：Test = 2025-02-01 ~ 2025-03-01, Train = 前 12 个月 ===
+train1_start = pd.Timestamp("2024-02-01")
+train1_end   = pd.Timestamp("2025-02-01")
+test1_start  = pd.Timestamp("2025-02-01")
+test1_end    = pd.Timestamp("2025-03-01")
+
+train1_mask = make_mask(train1_start, train1_end)
+test1_mask  = make_mask(test1_start,  test1_end)
+
+# === 场景 2：Test = 2025-03-01 ~ 2025-04-01, Train = 前 12 个月 ===
+train2_start = pd.Timestamp("2024-02-01")
+train2_end   = pd.Timestamp("2025-03-01")
+test2_start  = pd.Timestamp("2025-03-01")
+test2_end    = pd.Timestamp("2025-04-01")
+
+train2_mask = make_mask(train2_start, train2_end)
+test2_mask  = make_mask(test2_start,  test2_end)
+
+# === 场景 3（最晚 GA 测试月）：Test = 2025-04-01 ~ 2025-05-01 ===
+train3_start = pd.Timestamp("2024-02-01")
+train3_end   = pd.Timestamp("2025-04-01")
+test3_start  = pd.Timestamp("2025-04-01")
+test3_end    = pd.Timestamp("2025-05-01")
+
+train3_mask = make_mask(train3_start, train3_end)
+test3_mask  = make_mask(test3_start,  test3_end)
+
+# 为每个场景准备对应的 close / time（给回测函数用）
+scenario_list = [
+    {
+        "name": "S1_Train_20240201_20250201__Test_20250201_20250301",
+        "train_mask": train1_mask,
+        "test_mask":  test1_mask,
+        "close_test": merged.loc[test1_mask, "eth_hist_c"].reset_index(drop=True),
+        "time_test":  merged.loc[test1_mask, "datetime"].reset_index(drop=True),
+    },
+    {
+        "name": "S2_Train_20240301_20250301__Test_20250301_20250401",
+        "train_mask": train2_mask,
+        "test_mask":  test2_mask,
+        "close_test": merged.loc[test2_mask, "eth_hist_c"].reset_index(drop=True),
+        "time_test":  merged.loc[test2_mask, "datetime"].reset_index(drop=True),
+    },
+    {
+        "name": "S3_Train_20240401_20250401__Test_20250401_20250501",
+        "train_mask": train3_mask,
+        "test_mask":  test3_mask,
+        "close_test": merged.loc[test3_mask, "eth_hist_c"].reset_index(drop=True),
+        "time_test":  merged.loc[test3_mask, "datetime"].reset_index(drop=True),
+    },
+]
+
+print("✅ 场景列表构建完成：")
+for s in scenario_list:
+    print(s["name"],
+          " | Train 样本数:", int(s["train_mask"].sum()),
+          " | Test 样本数:",  int(s["test_mask"].sum()))
+
+def run_backtest_simple(
+    y_pred_test,
+    close_series,
+    time_series,
+    initial_capital=1_000_000.0,
+    trade_margin=1_000_000.0,
+    lev_long=1.0,
+    lev_short=1.0,
+    round_trip_cost_bps=0.0,
+    bars_per_day=6,
+):
+    """
+    用你当前脚本的极简 T→T+1 回测逻辑，但去掉了打印，只返回 Sharpe/收益等指标。
+    """
+    # === 信号生成：完全照你原来的写法 ===
+    sig = np.array(y_pred_test, dtype=float)
+    tttt = 0
+    low, high = np.percentile(sig, [50-tttt, 50+tttt])
+    sig_filtered = np.where((sig > low) & (sig < high), 0,
+                            np.where(sig >= high, 1, -1))
+    signal = pd.Series(sig_filtered)
+
+    close = close_series.reset_index(drop=True).copy()
+    time_s = time_series.reset_index(drop=True).copy()
+
+    N = min(len(signal), len(close), len(time_s))
+    signal = signal.iloc[:N].reset_index(drop=True)
+    close  = close.iloc[:N].reset_index(drop=True)
+    time_s = time_s.iloc[:N].reset_index(drop=True)
+
+    # t→t+1 收益
+    ret_next = close.pct_change().shift(-1)
+    valid_mask = ret_next.notna()
+    signal = signal[valid_mask].reset_index(drop=True)
+    close  = close[valid_mask].reset_index(drop=True)
+    time_s = time_s[valid_mask].reset_index(drop=True)
+    ret_next = ret_next[valid_mask].reset_index(drop=True)
+
+    equity = initial_capital
+    equity_curve = [equity]
+    cost_rate = round_trip_cost_bps / 1e4
+
+    for t in range(len(signal)):
+        side = int(signal.iloc[t])
+        if side == 0:
+            equity_curve.append(equity)
+            continue
+
+        px_in  = close.iloc[t]
+        px_out = close.iloc[t+1] if t+1 < len(close) else px_in
+
+        margin_used = trade_margin
+        lev = lev_long if side == 1 else lev_short
+        notional = margin_used * lev
+
+        gross_pnl = notional * side * ret_next.iloc[t]
+        cost = notional * cost_rate
+
+        equity += (gross_pnl - cost)
+        equity_curve.append(equity)
+
+    equity_curve = pd.Series(equity_curve)
+    ret_4h = equity_curve.pct_change().fillna(0)
+
+    # 年化 Sharpe
+    BARS_PER_YEAR = bars_per_day * 365
+    std_ret = ret_4h.std()
+    if std_ret < 1e-12:
+        sharpe_annual = 0.0
+    else:
+        sharpe_annual = (ret_4h.mean() / std_ret) * np.sqrt(BARS_PER_YEAR)
+
+    total_ret_pct = (equity / initial_capital - 1.0) * 100.0
+
+    # 最大回撤
+    rolling_max = equity_curve.cummax()
+    drawdown = (rolling_max - equity_curve) / rolling_max
+    max_dd_pct = drawdown.max() * 100.0
+
+    return {
+        "final_equity": equity,
+        "total_return_pct": total_ret_pct,
+        "sharpe_annual": sharpe_annual,
+        "max_drawdown_pct": max_dd_pct,
+        "equity_curve": equity_curve,
+    }
+
+
+# LightGBM 参数，和你上面训练时基本一致（可以自己微调）
+base_lgbm_params = dict(
+    n_estimators=500,
+    learning_rate=0.025,
+    max_depth=5,
+    # max_depth=3,
+    num_leaves=15,
+    subsample=0.8,
+    colsample_bytree=0.8,
+    reg_lambda=0.2,
+    reg_alpha=0.4,
+    min_child_samples=80,
+    random_state=42,
+    verbose=-1,
+    force_col_wise=True,
+    n_jobs=-1,
+)
+
+
+# ============ PyGAD 的适应度函数 ============
+def fitness_func(ga_instance, solution, solution_idx):
+    """
+    solution 是一个长度 = n_features 的 0/1 向量（是否选择特征）。
+    现在：对 scenario_list 里的所有 (Train, Test) 场景做打分，
+    用“多场景表现”来作为 GA 的 fitness（越大越好）。
+    """
+    mask = np.array(solution, dtype=int)
+    k = mask.sum()
+
+    # 1) 特征数量约束
+    if (k < MIN_FEATURES) or (k > MAX_FEATURES):
+        return -1e9
+
+    cols = [feature_names[i] for i, m in enumerate(mask) if m == 1]
+    if len(cols) == 0:
+        return -1e9
+
+    # 2) 在每个场景上分别训练+评估
+    rmse_list = []
+    sharpe_list = []
+    ret_list = []
+    dd_list = []
+
+    for scen in scenario_list:
+        train_mask_s = scen["train_mask"]
+        test_mask_s  = scen["test_mask"]
+
+        # 用全局 X_all / merged 按 mask 切子集
+        X_tr = X_all.loc[train_mask_s, cols]
+        X_te = X_all.loc[test_mask_s,  cols]
+        y_tr = merged.loc[train_mask_s, "y_target"]
+        y_te = merged.loc[test_mask_s,  "y_target"]
+
+        # 如果某个场景样本太少，就跳过
+        if len(X_tr) < 100 or len(X_te) < 50:
+            continue
+
+        model = LGBMRegressor(**base_lgbm_params)
+        model.fit(X_tr, y_tr)
+
+        y_pred_test = model.predict(X_te)
+
+        if GA_OBJECTIVE == "rmse":
+            rmse = np.sqrt(mean_squared_error(y_te, y_pred_test))
+            rmse_list.append(rmse)
+        else:
+            bt = run_backtest_simple(
+                y_pred_test,
+                scen["close_test"],
+                scen["time_test"],
+            )
+            sharpe_list.append(bt["sharpe_annual"])
+            ret_list.append(bt["total_return_pct"])
+            dd_list.append(bt["max_drawdown_pct"])
+
+    # 3) 把多个场景的结果聚合成一个分数（越大越好）
+    # 3) 把多个场景的结果聚合成一个分数（越大越好）
+    if GA_OBJECTIVE == "rmse":
+        if not rmse_list:
+            return -1e9
+        # 平均 RMSE 越小越好 → 取负
+        return -float(np.mean(rmse_list))
+
+    # 回测指标：若一个都没算出来，说明这组 F 太烂/没数据，直接给差评
+    if not sharpe_list and not ret_list and not dd_list:
+        return -1e9
+
+    # === 组合目标：Sharpe + 收益 - 回撤 ===
+    if GA_OBJECTIVE == "combo":
+        if (not sharpe_list) or (not ret_list) or (not dd_list):
+            return -1e9
+
+        mean_sharpe = float(np.mean(sharpe_list))      # 例如 2~6
+        mean_ret_pct = float(np.mean(ret_list))        # 单位：%
+        worst_dd_pct = float(np.max(dd_list))          # 单位：%
+
+        # 简单归一化一下百分比，避免量纲差太多
+        mean_ret = mean_ret_pct / 100.0
+        worst_dd = worst_dd_pct / 100.0
+
+        # 权重可以调，这里先给一个比较直觉的：
+        w_sharpe = 1.0   # 夏普权重
+        w_ret    = 0.5   # 收益权重（已经 /100）
+        w_dd     = 2.0   # 回撤惩罚（已经 /100）
+
+        score = w_sharpe * mean_sharpe + w_ret * mean_ret - w_dd * worst_dd
+        return score
+
+    # 保留原来的单目标分支以防你以后想切换
+    if GA_OBJECTIVE == "sharpe":
+        return float(np.mean(sharpe_list)) if sharpe_list else -1e9
+
+    if GA_OBJECTIVE == "total_return":
+        return float(np.mean(ret_list)) if ret_list else -1e9
+
+    if GA_OBJECTIVE == "max_drawdown_pct":
+        if not dd_list:
+            return -1e9
+        worst_dd = np.max(dd_list)  # 百分比
+        return -float(worst_dd)
+
+    # 默认：如果 GA_OBJECTIVE 写错了，就用平均 Sharpe 顶上
+    return float(np.mean(sharpe_list)) if sharpe_list else -1e9
+
+
+# ============ 配置并运行 GA ============
+from collections import Counter
+
+# === 可调参数：你自己改这两个数字即可 ===
+N_RUNS = 10          # 跑多少条随机路径（不同 random_seed）
+TOP_K_PER_RUN = 10   # 每条路径取最后一代里前多少个个体
+STABLE_THRESH = 0.6  # 频率阈值，比如 60% 以上视为“稳定特征”
+
+all_feature_sets = []  # 用来存所有 run 的 Top-K 特征子集
+
+for run_idx in range(N_RUNS):
+    seed = 2025 + run_idx  # 你也可以自己定义一个 seed 列表
+
+    print(f"\n🚀 开始 GA 特征选择（PyGAD）... Run {run_idx+1}/{N_RUNS}, random_seed={seed}")
+
+    # 每次都重新建一个 GA 实例（唯一改动是 random_seed）
+    ga = pygad.GA(
+        num_generations=30,  # 迭代次数
+        num_parents_mating=20,  # 父代数
+        fitness_func=fitness_func,  # 适应度函数
+        sol_per_pop=30,
+        num_genes=n_features,
+        gene_space=[0, 1],
+        gene_type=int,
+        parent_selection_type="tournament",
+        K_tournament=3,
+        crossover_type="single_point",
+        mutation_type="random",
+        mutation_percent_genes=10,
+        random_seed=seed,
+        stop_criteria=None,
+    )
+
+    ga.run()
+
+    # ====== 1️⃣ 取出这一条路径的最好一个解（方便打印看一眼） ======
+    solution, solution_fitness, solution_idx = ga.best_solution()
+    best_mask = np.array(solution, dtype=int)
+    best_features = [f for f, m in zip(feature_names, best_mask) if m == 1]
+
+    print(f"[Run {run_idx+1}] ✅ 最佳适应度值: {solution_fitness:.6f}")
+    print(f"[Run {run_idx+1}] 最佳特征数量: {len(best_features)}")
+    print(f"[Run {run_idx+1}] 最佳特征列表:")
+    print(best_features)
+
+    # ====== 2️⃣ 从最后一代里选出 Top-K 个个体 ======
+    pop = ga.population                      # shape: (sol_per_pop, num_genes)
+    fitness_vals = []
+
+    for idx, sol in enumerate(pop):
+        f = fitness_func(ga, sol, idx)       # 重新算一遍 fitness（和 GA 内部同一个函数）
+        fitness_vals.append(f)
+
+    fitness_vals = np.array(fitness_vals)
+    # 取 fitness 最大的 TOP_K_PER_RUN 个索引
+    top_idx = np.argsort(fitness_vals)[-TOP_K_PER_RUN:][::-1]
+
+    print(f"[Run {run_idx+1}] 选出最后一代 Top-{TOP_K_PER_RUN} 个特征子集用于统计频率：")
+    for rank, idx in enumerate(top_idx, start=1):
+        sol = pop[idx]
+        mask = np.array(sol, dtype=int)
+        feats = [f for f, m in zip(feature_names, mask) if m == 1]
+        fit_val = fitness_vals[idx]
+
+        all_feature_sets.append(feats)
+
+        print(f"  - Top {rank}: fitness={fit_val:.6f}, n_feats={len(feats)}")
+        print(f"    特征: {feats}")
+
+# ====== 3️⃣ 统计所有 run + Top-K 的特征出现频率 ======
+cnt = Counter()
+for feats in all_feature_sets:
+    cnt.update(feats)
+
+total_sets = len(all_feature_sets)  # 理论上 = N_RUNS * TOP_K_PER_RUN
+
+# 按出现次数从高到低排序
+sorted_feats = sorted(cnt.items(), key=lambda x: x[1], reverse=True)
+
+print("\n📊 特征出现频次（按从高到低排序）:")
+for feat, c in sorted_feats:
+    freq = c / total_sets
+    print(f"{feat}: 出现 {c} 次 / 共 {total_sets} 组 ({freq:.1%})")
+
+# ====== 4️⃣ 按频率挑“稳定特征” ======
+stable_features = [feat for feat, c in sorted_feats if c / total_sets >= STABLE_THRESH]
+
+print(f"\n✨ 稳定特征（出现频率 ≥ {STABLE_THRESH:.0%}）：共 {len(stable_features)} 个")
+print(stable_features)
+
+# ====== 5️⃣ 用稳定特征构造最终训练 / 测试矩阵 ======
+if len(stable_features) == 0:
+    print("⚠️ 没有特征达到稳定阈值，建议降低 STABLE_THRESH 或检查 GA 设置。")
+    # 兜底：退回最后一次 run 的 best_features
+    final_features = best_features
+    print("使用最后一次 GA 的最佳特征作为兜底：")
+else:
+    final_features = stable_features
+
+print(f"\n🎯 最终采用特征数量: {len(final_features)}")
+print(final_features)
+
+X_train_ga = X_train[final_features].copy()
+X_test_ga  = X_test[final_features].copy()
+print(f"🎯 GA 稳健特征维度: {X_train_ga.shape[1]}")
+
+
+
