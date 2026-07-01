@@ -8,32 +8,12 @@ import os
 # ====== 1 读取数据 ====== 注意以 8:00:00为例 o为当前价格 c为12:00的价格 hl为8-12点的最高最低价
 # ---- 宏观经济类 ----
 macro_paths = {
-    "VIX": "VIX_4h.csv",              # 芝加哥波动率指数（市场恐慌指标）
-    "SPX": "SPX_4h.csv",              # 标普500指数（美股市场走势）
-    "NASX": "NASX_4h.csv",            # 纳斯达克综合指数
-    "GBTC": "GBTC_4h.csv",            # 灰度比特币信托基金（比特币溢价指标）
-    "DXY": "DXY_4h.csv",              # 美元指数（宏观流动性指标）
-    "OVX": "OVX_4h.csv",              # 原油波动率指数（能源市场风险指标）
-    "XAUUSD": "XAUUSD_4h.csv",        # 现货黄金价格（避险资产代表）
-    # new feature
-    "TLT": "TLT_4h.csv",
-    "SHY": "SHY_4h.csv"
+xxxxxxxxxxx
 }
 
 # ---- ETH 市场类（共 11 个） ----
 eth_paths = {
-    "eth_hist":              "eth_1h_hist_4h.csv",           # ETH 历史K线（开高低收成交量）
-    "eth_vol_weight":        "eth_1h_volweightohlc_4h.csv",         # 按成交量加权的资金费率
-    "eth_oi_weight":         "eth_1h_oiweightohlc_4h.csv",          # 按持仓量加权的资金费率
-    "eth_dvol":              "eth_1h_Dvol_4h.csv",           # Deribit 隐含波动率（聚合为4h）
-    "eth_liq":               "eth_1h_liq_4h.csv",    # （可选）多空爆仓金额（4h）
-    "eth_oi":                "eth_1h_marketoi_4h.csv",       # 市场持仓量（Open Interest）
-    "eth_buy_sell":          "eth_1h_buy_sell_4h.csv",       # 主动买入/卖出成交量
-    "eth_coinmarketcap":     "eth_1h_coinmarketcap_4h.csv",  # 市值与流通量等指标
-    "eth_trans_btc":         "eth_1h_eth_trans_btc_4h.csv",  # ETH/BTC 链上转账比率
-    "eth_stable_margin":     "eth_1h_stablecoin-margin_4h.csv", # 稳定币保证金占比
-    "eth_timeseries":        "eth_1h_timeseries_4h.csv",     # ETH 价格及波动时间序列（辅助特征）
-    # "eth_4h_VWAP":           "eth_4h_vwap.csv",              # 4小时加权平均成交价（VWAP 目标）
+xxxxxxxxxxxxxxxxx
 }
 
 
