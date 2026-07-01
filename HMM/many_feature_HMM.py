@@ -4,17 +4,7 @@ from pathlib import Path
 # === 1️⃣ 基本配置 ===
 base_dir = Path(".")
 files = [
-    "eth_1h_history.csv",
-    "eth_1h_buy_sell.csv",
-    "eth_1h_coinmarketcap.csv",
-    "eth_1h_Dvol.csv",
-    "eth_1h_eth_trans_btc.csv",
-    "eth_1h_Liquidation.csv",
-    "eth_1h_marketoi.csv",
-    "eth_1h_oi_weight_ohlc.csv",
-    "eth_1h_stablecoin-margin.csv",
-    "eth_1h_timeseries.csv",
-    "eth_1h_vol_weight_ohlc.csv",
+xxxxxxxxxxxxxxxx
 ]
 
 # === 2️⃣ 时间范围 ===
